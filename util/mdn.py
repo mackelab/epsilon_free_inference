@@ -57,18 +57,30 @@ class MDN:
         self.ms = [tt.dot(self.net.hs[-1], Wm) + bm for Wm, bm in izip(self.Wms, self.bms)]
 
         # mixture precisions
-        # note that U here is an upper triangular matrix such that U'*U is the precision
+        # note that U here is an upper triangular matrix such that U'*U + V'*V is the precision
         self.WUs = [theano.shared((rng.randn(self.net.n_outputs, n_outputs**2) / np.sqrt(self.net.n_outputs + 1)).astype(dtype), name='WU'+str(i)) for i in xrange(n_components)]
         self.bUs = [theano.shared(rng.randn(n_outputs**2).astype(dtype), name='bU'+str(i)) for i in xrange(n_components)]
         aUs = [tt.reshape(tt.dot(self.net.hs[-1], WU) + bU, [-1, n_outputs, n_outputs]) for WU, bU in izip(self.WUs, self.bUs)]
         triu_mask = np.triu(np.ones([n_outputs, n_outputs], dtype=dtype), 1)
         diag_mask = np.eye(n_outputs, dtype=dtype)
+        
+        #self.Us = [triu_mask * aU + diag_mask * tt.exp(diag_mask * aU) for aU in aUs]
         self.Us = [triu_mask * aU + diag_mask * tt.exp(diag_mask * aU) for aU in aUs]
         ldetUs = [tt.sum(tt.sum(diag_mask * aU, axis=2), axis=1) for aU in aUs]
+        self.Vs = [np.zeros((self.net.n_outputs, n_outputs, n_outputs)).astype(dtype) for i in xrange(n_components)]
+        ldetUVs = [tt.zeros(self.net.n_outputs) for i in xrange(n_components)]
+        for i in xrange(n_components):
+            for j in xrange(self.net.n_outputs):
+                U = self.Us[i][j,:,:]
+                V = self.Vs[i][j,:,:]
+                ldetUVs[i] = .5 * tt.log(tt.nlinalg.Det()( tt.dot(U.dimshuffle([1, 0]),U)  + V.T.dot(V)))
 
         # log probabilities
         self.y = tt.matrix('y')
-        lprobs_comps = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * U, axis=2)**2, axis=1) + ldetU for m, U, ldetU in izip(self.ms, self.Us, ldetUs)]
+        lprobs_comps_U = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * U, axis=2)**2, axis=1) for m, U in izip(self.ms, self.Us)]
+        lprobs_comps_V = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * V, axis=2)**2, axis=1) for m, V in izip(self.ms, self.Vs)]
+        lprobs_comps = [lU + lV + ldetUV for lU,lV,ldetUV in izip(lprobs_comps_U,lprobs_comps_V,ldetUVs)]        
+        #lprobs_comps = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * U, axis=2)**2, axis=1) + ldetU for m, U, ldetU in izip(self.ms, self.Us, ldetUs)]
         self.lprobs = tt.log(tt.sum(tt.exp(tt.stack(lprobs_comps, axis=1) + tt.log(self.a)), axis=1)) - (0.5 * n_outputs * np.log(2*np.pi))
         self.mlprob = -tt.mean(self.lprobs)
 
@@ -85,6 +97,9 @@ class MDN:
         self.n_components = n_components
         self.act_fun = act_fun
 
+    def set_sqrt_prior_precisions(self,Vs):
+        assert len(Vs) == len(self.Us)
+        self.Vs = Vs.copy()
 
     def initialize_mog(self, y):
 
@@ -267,7 +282,7 @@ class MDN_SVI:
     Implements a bayesian mixture density network with full precision matrices, using stochastic variational inference.
     """
 
-    def __init__(self, n_inputs, n_hiddens, act_fun, n_outputs, n_components):
+    def __init__(self, n_inputs, n_hiddens, act_fun, n_outputs, n_components, Vs = None):
         """
         Constructs an svi mdn with a given architecture. Note that the mdn has full precision matrices.
         :param n_inputs: dimensionality of the input
@@ -293,6 +308,13 @@ class MDN_SVI:
             self.net.addLayer(h, act_fun)
         self.input = self.net.hs[0]
         self.srng = self.net.srng
+
+        n_data = self.input.shape[0]
+
+        if Vs is None:
+            self.Vs = [theano.shared(np.zeros((n_outputs, n_outputs)).astype(dtype), name='V'+str(i)) for i in xrange(n_components)]
+        else:
+            self.Vs = [theano.shared(Vs[i].astype(dtype), name='V'+str(i)) for i in xrange(n_components)]
 
         # the naming scheme of the theano variables from now on might look a bit cryptic but it actually makes sense
         # each variable name has 3 or 4 letters, with the following meanings:
@@ -326,7 +348,7 @@ class MDN_SVI:
         self.ms = zams
 
         # mixture precisions
-        # note that U here is an upper triangular matrix such that U'*U is the precision
+        # note that U here is an upper triangular matrix such that U'*U + V'*V is the precision
         self.mWUs = [theano.shared((rng.randn(self.net.n_outputs, n_outputs**2) / np.sqrt(self.net.n_outputs + 1)).astype(dtype), name='mWU'+str(i)) for i in xrange(n_components)]
         self.mbUs = [theano.shared(rng.randn(n_outputs**2).astype(dtype), name='mbU'+str(i)) for i in xrange(n_components)]
         self.sWUs = [theano.shared(-5.0 * np.ones([self.net.n_outputs, n_outputs**2], dtype=dtype), name='sWU'+str(i)) for i in xrange(n_components)]
@@ -339,11 +361,21 @@ class MDN_SVI:
         triu_mask = np.triu(np.ones([n_outputs, n_outputs], dtype=dtype), 1)
         diag_mask = np.eye(n_outputs, dtype=dtype)
         self.Us = [triu_mask * zaU + diag_mask * tt.exp(diag_mask * zaU) for zaU in zaUs_reshaped]
-        ldetUs = [tt.sum(tt.sum(diag_mask * zaU, axis=2), axis=1) for zaU in zaUs_reshaped]
+
+        # computing logdet of precision matrices
+        self.Ps = [theano.scan(fn=lambda U,V: tt.dot(U.dimshuffle([1, 0]),U) + tt.dot(V.dimshuffle([1, 0]),V),
+                               outputs_info = None,
+                               sequences = self.Us[i],
+                               non_sequences = self.Vs[i] )[0] for i in xrange(n_components)]            
+        ldetPs = [theano.scan(fn=lambda P: .5 * tt.log(tt.nlinalg.Det()( P )),
+                              outputs_info = None,
+                              sequences = self.Ps[i])[0] for i in xrange(n_components)]
 
         # log probabilities
         self.y = tt.matrix('y')
-        lprobs_comps = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * U, axis=2)**2, axis=1) + ldetU for m, U, ldetU in izip(self.ms, self.Us, ldetUs)]
+        self.lprobs_comps_U = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * U, axis=2)**2, axis=1) for m, U in izip(self.ms, self.Us)]
+        self.lprobs_comps_V = [-0.5 * tt.sum(tt.sum((self.y-m).dimshuffle([0, 'x', 1]) * V.dimshuffle(['x', 0, 1]), axis=2)**2, axis=1) for m, V in izip(self.ms, self.Vs)]
+        lprobs_comps = [lU + lV + ldetP for lU,lV,ldetP in izip(self.lprobs_comps_U,self.lprobs_comps_V,ldetPs)]
         self.lprobs = tt.log(tt.sum(tt.exp(tt.stack(lprobs_comps, axis=1) + tt.log(self.a)), axis=1)) - (0.5 * n_outputs * np.log(2*np.pi))
         self.mlprob = -tt.mean(self.lprobs)
 
@@ -367,6 +399,11 @@ class MDN_SVI:
         self.n_components = n_components
         self.act_fun = act_fun
 
+    def set_sqrt_prior_precisions(self,Vs):
+        assert len(Vs) == self.n_components
+
+        for i in xrange(self.n_components):
+            self.Vs[i].set_value(Vs[i].astype(dtype)) 
 
     def initialize_mog(self, y):
 
@@ -433,7 +470,7 @@ class MDN_SVI:
 
                 self.eval_comps_f_rand = theano.function(
                     inputs=[self.input, n_data],
-                    outputs=[self.a] + self.ms + self.Us,
+                    outputs=[self.a] + self.ms + self.Ps,
                     givens=zip(self.uas, uas)
                 )
 
@@ -445,7 +482,7 @@ class MDN_SVI:
             if self.eval_comps_f == None:
                 self.eval_comps_f = theano.function(
                     inputs=[self.input],
-                    outputs=[self.a] + self.ms + self.Us,
+                    outputs=[self.a] + self.ms + self.Ps,
                     givens=zip(self.zas, self.mas)
                 )
 
@@ -478,7 +515,7 @@ class MDN_SVI:
                     givens=zip(self.uas, uas)
                 )
 
-            return self.eval_lprobs_f_rand(x.astype(dtype), y.astype(dtype), x.shape[0])
+            return self.eval_lprobs_f_rand(x.astype(dtype), y.astype(dtype), x.shape[0], self.Vs)
 
         else:
 
@@ -491,6 +528,19 @@ class MDN_SVI:
                 )
 
             return self.eval_lprobs_f(x.astype(dtype), y.astype(dtype))
+
+
+    def eval_debug(self, xy):
+
+        x, y = xy
+        assert x.shape[0] == y.shape[0]        
+        self.eval_comps_f_debug = theano.function(
+            inputs=[self.input,self.y],
+            outputs=[self.a] + self.ms + self.Us + self.Ps + [self.lprobs],
+            givens=zip(self.zas, self.mas)
+        )
+        comps = self.eval_comps_f_debug(x.astype(dtype), y.astype(dtype))
+        return comps[0], comps[1:self.n_components+1], comps[self.n_components+1:2*self.n_components+1], comps[2*self.n_components+1:3*self.n_components+1],  comps[-1]
 
 
     def get_mog(self, x, n_samples=None):
@@ -509,10 +559,10 @@ class MDN_SVI:
         if n_samples is None:  # no randomness
 
             # gather mog parameters
-            a, ms, Us = self.eval_comps(x, rand=False)
+            a, ms, Ps = self.eval_comps(x, rand=False)
             a = a[0]
             ms = [m[0] for m in ms]
-            Us = [U[0] for U in Us]
+            Ps = [P[0] for P in Ps]
 
         else:  # sample from mdn, and form a mog with all the samples
 
@@ -525,13 +575,13 @@ class MDN_SVI:
             for _ in xrange(n_samples):
 
                 # generate a mog and gather its parameters
-                ai, mis, Uis = self.eval_comps(x, rand=True)
+                ai, mis, Pis = self.eval_comps(x, rand=True)
                 a = np.append(a, ai[0] / n_samples)
                 ms += [mi[0] for mi in mis]
-                Us += [Ui[0] for Ui in Uis]
+                Ps += [Pi[0] for Pi in Pis]
 
         # return mog
-        return pdf.MoG(a=a, ms=ms, Us=Us)
+        return pdf.MoG(a=a, ms=ms, Ps=Ps)
 
 
     def gen(self, x, n_samples=1, rand=False):
@@ -564,7 +614,7 @@ class MDN_SVI:
         Returns a conventional mdn that is otherwise the same as this mdn.
         """
 
-        net = MDN(n_inputs=self.n_inputs, n_hiddens=self.net.n_units[1:], act_fun=self.act_fun, n_outputs=self.n_outputs, n_components=self.n_components)
+        net = MDN(n_inputs=self.n_inputs, n_hiddens=self.net.n_units[1:], act_fun=self.act_fun, n_outputs=self.n_outputs, n_components=self.n_components, Vs = self.Vs)
 
         for W, b, mW, mb in izip(net.net.Ws, net.net.bs, self.net.mWs, self.net.mbs):
             W.set_value(mW.get_value())
@@ -690,11 +740,12 @@ def replicate_gaussian_mdn(net, n_rep):
         mog_net.Wa.set_value(np.zeros_like(mog_net.Wa.get_value()))
         mog_net.ba.set_value(np.zeros_like(mog_net.ba.get_value()))
 
-        for Wm, bm, WU, bU in izip(mog_net.Wms, mog_net.bms, mog_net.WUs, mog_net.bUs):
+        for Wm, bm, WU, bU in izip(mog_net.Wms, mog_net.bms, mog_net.WUs, mog_net.bUs, mog_net.Vs):
             Wm.set_value(net.Wms[0].get_value())
             bm.set_value(net.bms[0].get_value())
             WU.set_value(net.WUs[0].get_value())
             bU.set_value(net.bUs[0].get_value())
+            V.set_value(net.Vs[0].get_value())
 
         for bm in mog_net.bms:
             bm.set_value(bm.get_value() + 1.0e-6 * rng.randn(*bm.get_value().shape).astype(dtype))
@@ -713,7 +764,7 @@ def replicate_gaussian_mdn(net, n_rep):
         mog_net.sWa.set_value(-5.0 * np.ones_like(mog_net.sWa.get_value()))
         mog_net.sba.set_value(-5.0 * np.ones_like(mog_net.sba.get_value()))
 
-        for mWm, mbm, mWU, mbU, sWm, sbm, sWU, sbU in izip(mog_net.mWms, mog_net.mbms, mog_net.mWUs, mog_net.mbUs, mog_net.sWms, mog_net.sbms, mog_net.sWUs, mog_net.sbUs):
+        for mWm, mbm, mWU, mbU, sWm, sbm, sWU, sbU, V in izip(mog_net.mWms, mog_net.mbms, mog_net.mWUs, mog_net.mbUs, mog_net.sWms, mog_net.sbms, mog_net.sWUs, mog_net.sbUs, mog_net.Vs):
             mWm.set_value(net.mWms[0].get_value())
             mbm.set_value(net.mbms[0].get_value())
             mWU.set_value(net.mWUs[0].get_value())
@@ -722,6 +773,7 @@ def replicate_gaussian_mdn(net, n_rep):
             sbm.set_value(net.sbms[0].get_value())
             sWU.set_value(net.sWUs[0].get_value())
             sbU.set_value(net.sbUs[0].get_value())
+            V.set_value(net.Vs[0].get_value())
 
         for mbm in mog_net.mbms:
             mbm.set_value(mbm.get_value() + 1.0e-6 * rng.randn(*mbm.get_value().shape).astype(dtype))
